@@ -4,7 +4,8 @@
 //! threads freely while the orchestrator keeps listening.
 
 use super::*;
-use zeron_proto::voice::{VoicePhase, VoiceWork};
+use crate::notice::{NoticeChipIcon, notice_chip};
+use zeron_proto::voice::VoiceWork;
 
 /// The stage paints the hero preset magnified to fill the canvas.
 pub(super) const VOICE_STAGE_ORB_SCALE: f32 = 2.25;
@@ -134,9 +135,8 @@ impl Shell {
         }
         let live = voice.is_live();
         let stage_open = voice.stage_open;
-        let failure = (voice.phase == VoicePhase::Failed)
-            .then(|| voice.reason_text())
-            .filter(|text| !text.is_empty());
+        let failure = voice.failure_text();
+        let failed = failure.is_some();
         let (orb_state, microphone, speaker) = (
             voice.orb_state(),
             voice.microphone_level(),
@@ -210,49 +210,12 @@ impl Shell {
                         theme.text,
                     )),
             );
-        let Some(failure) = failure else {
+        if !failed {
             return Some(button.into_any_element());
-        };
-        // A failed start explains itself once, anchored to the microphone;
-        // the next press retries.
-        let popup_theme = theme.for_popup();
-        let card = popover::popover_card(&popup_theme)
-            .w(px(232.0))
-            .flex()
-            .flex_row()
-            .items_start()
-            .gap(px(8.0))
-            .child(
-                icon(icons::DANGER_TRIANGLE)
-                    .mt(px(1.0))
-                    .size(px(14.0))
-                    .text_color(popup_theme.warning),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .text_size(crate::typography::ui_rems(12.0))
-                    .text_color(popup_theme.text_muted)
-                    .child(SharedString::from(failure)),
-            )
-            .child(
-                div()
-                    .id("voice-failure-dismiss")
-                    .flex_none()
-                    .cursor_pointer()
-                    .rounded(px(4.0))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        cx.stop_propagation();
-                        this.voice.update(cx, |voice, cx| voice.dismiss_reason(cx));
-                    }))
-                    .child(
-                        icon(icons::CLOSE)
-                            .size(px(14.0))
-                            .text_color(popup_theme.text_faint),
-                    ),
-            )
-            .into_any_element();
+        }
+        // A failed start marks the microphone; the reason itself is the
+        // footer's notice (`render_voice_failure_notice`). The next press
+        // retries.
         button
             .child(
                 div()
@@ -263,13 +226,70 @@ impl Shell {
                     .rounded_full()
                     .bg(theme.warning),
             )
-            .child(popover::anchored_menu_above_end(
-                "voice-failure",
-                card,
-                None,
-            ))
             .into_any_element()
             .into()
+    }
+
+    /// Why the last call failed, in the footer's own flow above its row,
+    /// until it is retried or dismissed. Never a floating layer: a popover
+    /// without an outside-dismiss swallows every press on the rest of the
+    /// window, and one anchored here outlives a collapsed sidebar's clip.
+    pub(super) fn render_voice_failure_notice(
+        &mut self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let reason = self.voice.read(cx).failure_text()?;
+        let tone = theme.warning;
+        let action = |id: &'static str, label: &'static str, name: &'static str| {
+            div()
+                .id(id)
+                .debug_selector(move || id.into())
+                .role(gpui::Role::Button)
+                .aria_label(name)
+                .tab_index(0)
+                .px(px(6.0))
+                .py(px(2.0))
+                .rounded(px(Theme::CONTROL_RADIUS))
+                .border_1()
+                .border_color(tone.opacity(0.0))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .cursor_pointer()
+                .hover(move |s| s.bg(tone.opacity(0.12)))
+                .focus_visible(|s| s.border_color(theme.accent))
+                .child(label)
+        };
+        Some(
+            notice_chip(
+                theme,
+                true,
+                "Voice call failed",
+                reason,
+                NoticeChipIcon::Plain,
+            )
+            .id("voice-failure-notice")
+            .debug_selector(|| "voice-failure-notice".into())
+            .role(gpui::Role::Alert)
+            .aria_label(format!("Voice call failed. {reason}"))
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap(px(Theme::SPACE_XS))
+                    .child(
+                        action("voice-failure-retry", "Retry", "Retry voice")
+                            .on_click(cx.listener(|this, _, _, cx| this.start_voice(cx))),
+                    )
+                    .child(
+                        action("voice-failure-dismiss", "Dismiss", "Dismiss voice error").on_click(
+                            cx.listener(|this, _, _, cx| {
+                                this.voice.update(cx, |voice, cx| voice.dismiss_reason(cx));
+                            }),
+                        ),
+                    ),
+            )
+            .into_any_element(),
+        )
     }
 
     /// The live orb above the orchestrator chat's composer. Every other chat
@@ -778,6 +798,7 @@ fn round_control(id: &'static str, theme: &Theme, active: bool) -> gpui::Statefu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zeron_proto::voice::VoicePhase;
 
     #[gpui::test]
     fn voice_stage_topbar_accepts_window_drag_presses(cx: &mut gpui::TestAppContext) {
@@ -1105,6 +1126,145 @@ mod tests {
         let orb = cx.debug_bounds("voice-composer-orb").unwrap();
         cx.simulate_click(orb.center(), gpui::Modifiers::default());
         shell.read_with(cx, |shell, cx| assert!(shell.voice.read(cx).stage_open));
+    }
+
+    #[gpui::test]
+    fn voice_failure_notice_never_swallows_presses_on_other_controls(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // The footer row at the bottom of a column, as in the sidebar, with
+        // room above it for whatever the failure mounts.
+        struct FooterHost(Entity<Shell>);
+        impl Render for FooterHost {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                self.0.update(cx, |shell, cx| {
+                    div()
+                        .w(px(256.0))
+                        .h(px(480.0))
+                        .flex()
+                        .flex_col()
+                        .justify_end()
+                        .child(shell.render_sidebar_footer_row(&Theme::default(), cx))
+                })
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+            crate::app_menus::init(cx);
+            settings::init(settings::UiSettings::default(), dir.path(), cx);
+        });
+        let (host, cx) = cx.add_window_view(|_, cx| {
+            FooterHost(cx.new(|cx| {
+                let state = cx.new(|_| AppState::new());
+                Shell::new(
+                    state,
+                    EngineBootConfig {
+                        data_dir: dir.path().into(),
+                        ipc_port: 0,
+                        edge_url: "http://127.0.0.1:1".into(),
+                        edge_token: None,
+                        org_id: None,
+                        workos_client_id: None,
+                        default_harness: HarnessId::Mock,
+                    },
+                    cx,
+                )
+            }))
+        });
+        let shell = host.read_with(cx, |host, _| host.0.clone());
+        // A start that failed on the audio devices, with no audio involved.
+        let fail = |cx: &mut gpui::VisualTestContext| {
+            shell.update(cx, |shell, cx| {
+                shell.voice.update(cx, |voice, cx| {
+                    voice.phase = VoicePhase::Failed;
+                    voice.reason = Some(zeron_proto::voice::VoiceRejection::DeviceUnavailable);
+                    cx.notify();
+                });
+            });
+            cx.update(|window, cx| window.draw(cx).clear());
+        };
+        let failed = |cx: &mut gpui::VisualTestContext| {
+            shell.read_with(cx, |shell, cx| {
+                let voice = shell.voice.read(cx);
+                voice.phase == VoicePhase::Failed && voice.reason.is_some()
+            })
+        };
+        let click = |selector: &'static str, cx: &mut gpui::VisualTestContext| {
+            cx.update(|window, cx| window.draw(cx).clear());
+            let bounds = cx.debug_bounds(selector).unwrap();
+            cx.simulate_click(bounds.center(), gpui::Modifiers::default());
+        };
+        // Enter on the focused control: GPUI clicks on the key release.
+        let press_enter = |cx: &mut gpui::VisualTestContext| {
+            cx.simulate_keystrokes("enter");
+            cx.update(|window, cx| {
+                window.dispatch_event(
+                    gpui::PlatformInput::KeyUp(gpui::KeyUpEvent {
+                        keystroke: gpui::Keystroke::parse("enter").unwrap(),
+                    }),
+                    cx,
+                );
+            });
+            cx.run_until_parked();
+        };
+        let focus_next = |cx: &mut gpui::VisualTestContext| {
+            cx.update(|window, cx| {
+                window.draw(cx).clear();
+                window.focus_next(cx);
+                window.draw(cx).clear();
+            });
+        };
+
+        fail(cx);
+        assert!(cx.debug_bounds("voice-trigger").is_some());
+
+        // Each press on another control acts at once, the failure still up.
+        for expect_settings in [true, false] {
+            click("settings-trigger", cx);
+            shell.read_with(cx, |shell, _| {
+                assert_eq!(
+                    matches!(shell.route, Route::Settings(_)),
+                    expect_settings,
+                    "the voice failure swallowed a press on Settings"
+                );
+            });
+        }
+        assert!(failed(cx), "a press elsewhere is not a dismissal");
+
+        // The reason sits in the footer's own flow, above the row.
+        cx.update(|window, cx| window.draw(cx).clear());
+        let notice = cx.debug_bounds("voice-failure-notice").unwrap();
+        let row = cx.debug_bounds("sidebar-footer-row").unwrap();
+        assert!(notice.bottom() <= row.top() && notice.left() >= row.left());
+        assert!(cx.debug_bounds("voice-trigger").is_some());
+
+        // Keyboard: Retry is the first stop, Dismiss the next. With no engine
+        // connected a retry places no call, so the reason stays.
+        focus_next(cx);
+        press_enter(cx);
+        assert!(failed(cx), "Retry is not a dismissal");
+        focus_next(cx);
+        press_enter(cx);
+        shell.read_with(cx, |shell, cx| {
+            let voice = shell.voice.read(cx);
+            assert_eq!(voice.phase, VoicePhase::Closed);
+            assert!(voice.reason.is_none());
+        });
+        cx.update(|window, cx| window.draw(cx).clear());
+        assert!(cx.debug_bounds("voice-failure-notice").is_none());
+        assert!(cx.debug_bounds("voice-trigger").is_some());
+
+        // The same two controls by mouse.
+        fail(cx);
+        click("voice-failure-retry", cx);
+        assert!(failed(cx));
+        click("voice-failure-dismiss", cx);
+        assert!(!failed(cx));
+        cx.update(|window, cx| window.draw(cx).clear());
+        assert!(cx.debug_bounds("voice-failure-notice").is_none());
     }
 
     #[test]

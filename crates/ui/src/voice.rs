@@ -386,6 +386,12 @@ impl VoiceController {
         }
         cx.notify();
     }
+    /// What to tell the user about a call that failed and is still unseen.
+    pub fn failure_text(&self) -> Option<&'static str> {
+        (self.phase == VoicePhase::Failed)
+            .then(|| self.reason_text())
+            .filter(|text| !text.is_empty())
+    }
     pub fn reason_text(&self) -> &'static str {
         match self.reason {
             Some(VoiceRejection::CreditExclusionUnverified) => {

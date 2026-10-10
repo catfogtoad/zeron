@@ -9136,7 +9136,8 @@ impl Shell {
     /// Account, settings, and the Pull requests entry. Chat and Settings both
     /// render this exact row so the footer holds still across the swap.
     fn render_sidebar_footer_row(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        div()
+        let voice_failure = self.render_voice_failure_notice(theme, cx);
+        let row = div()
             .id("sidebar-footer-row")
             .debug_selector(|| "sidebar-footer-row".into())
             .w_full()
@@ -9148,7 +9149,18 @@ impl Shell {
                     .flex_1()
                     .min_w_0()
                     .child(self.render_sidebar_footer(theme, cx)),
-            )
+            );
+        let Some(voice_failure) = voice_failure else {
+            return row.into_any_element();
+        };
+        // A failed call's reason stacks on the row, in both sidebars.
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap(px(Theme::SPACE_SM))
+            .child(voice_failure)
+            .child(row)
             .into_any_element()
     }
 
